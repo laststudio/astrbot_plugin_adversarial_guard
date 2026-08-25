@@ -1,0 +1,6 @@
+name: astrbot_plugin_adversarial_guard
+display_name: 对抗人格守护
+desc: "GAN 式双 AI 对抗架构：判官 AI(A) 实时审查主 AI(B) 的输出是否遵守人格提示词，违规时自动快改/带反馈重生成，并以奖惩记账 + 上下文反馈注入模拟强化学习，让 B 越用越听话。"
+version: v1.0.0
+author: yourname
+repo: https://github.com/yourname/astrbot_plugin_adversarial_guard

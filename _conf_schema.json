@@ -1,0 +1,73 @@
+{
+  "enable": {
+    "description": "插件总开关。关闭后所有会话不再进行审查（会话级 /guard on|off 仍然优先）。",
+    "type": "bool",
+    "default": true
+  },
+  "violation_action": {
+    "description": "判官 A 判定违规后的处理策略：fast_fix_then_regen=先用A的改写、失败则降级为带反馈重新生成；regen_only=只走重生成对抗循环；record_only=放行原回复，仅记账并在后续轮次注入惩罚提示。",
+    "type": "string",
+    "options": [
+      "fast_fix_then_regen",
+      "regen_only",
+      "record_only"
+    ],
+    "default": "fast_fix_then_regen"
+  },
+  "max_regen_rounds": {
+    "description": "对抗循环中最多重新生成的轮数（防止死循环与成本失控）。",
+    "type": "int",
+    "default": 2
+  },
+  "score_threshold": {
+    "description": "合规分数阈值（0-100）。判官给出的分数低于该值视为违规。",
+    "type": "int",
+    "default": 70
+  },
+  "judge_provider_id": {
+    "description": "判官 AI(A) 使用的提供商 ID。留空 = 跟随当前主 AI(B) 的提供商。",
+    "type": "string",
+    "default": "",
+    "hint": "可在 WebUI『服务提供商』页查看 provider id，例如 openai_1"
+  },
+  "judge_model": {
+    "description": "判官 AI(A) 强制使用的模型名。留空 = 使用提供商默认模型。注意：重生成(B)始终使用主模型，不受此项影响。",
+    "type": "string",
+    "default": ""
+  },
+  "feedback_injection": {
+    "description": "RL 模拟：将近期违规记录（惩罚记忆）注入到后续 LLM 请求中，随窗口衰减。",
+    "type": "bool",
+    "default": true
+  },
+  "feedback_window": {
+    "description": "反馈注入窗口：统计最近 N 次被审查对话中的违规用于注入。",
+    "type": "int",
+    "default": 5
+  },
+  "reward_decay": {
+    "description": "纪律分衰减系数（0-1）。每次审查后历史得分按此系数衰减，越接近1记得越久。",
+    "type": "float",
+    "default": 0.8
+  },
+  "judge_timeout": {
+    "description": "单次判官/重生成调用超时秒数。超时或出错时一律放行原文，绝不阻塞正常聊天。",
+    "type": "int",
+    "default": 30
+  },
+  "max_judge_chars": {
+    "description": "送审判官的回复文本最大长度，超长截断（保护 token 开销）。",
+    "type": "int",
+    "default": 4000
+  },
+  "history_turns_for_judge": {
+    "description": "提供给判官的上下文消息条数上限。",
+    "type": "int",
+    "default": 6
+  },
+  "notify_on_fix": {
+    "description": "修复成功后是否在聊天中发送一条简短提示（默认关闭，仅记录日志）。",
+    "type": "bool",
+    "default": false
+  }
+}

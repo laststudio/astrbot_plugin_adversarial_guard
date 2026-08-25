@@ -1,0 +1,7 @@
+# 本插件的防御性设计要求：任何钩子/判官异常都必须吞掉并降级放行，
+# 绝不能让审查失败阻断正常聊天；因此豁免"盲捕获 Exception"与 try-except-pass 规则。
+target-version = "py310"
+line-length = 100
+
+[lint]
+ignore = ["BLE001", "S110"]
