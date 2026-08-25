@@ -82,7 +82,6 @@ async def run_adversarial_repair(
         attempts = []
 
     # ---------- 第 2 步：重生成对抗循环 ----------
-    best: tuple[int, str, Verdict | None] | None = None
     for i in range(1, max(0, int(max_regen_rounds)) + 1):
         prompt = build_regen_prompt(
             user_msg, last_violations or first_verdict.violations, i, max_regen_rounds
@@ -95,31 +94,28 @@ async def run_adversarial_repair(
             continue
         v = await judge_fn(reply)
         passed = v is not None and (v.compliant and v.score >= threshold)
-        cand = (0, reply, v)  # 重生成结果优先级高于快改
-        candidates.append(cand)
+        candidates.append((0, reply, v))  # 重生成结果优先级高于快改
         attempts.append({"source": f"regen_{i}", "score": v.score if v else None, "ok": passed})
         if passed:
             return RepairResult(reply, v, True, "regen", attempts)
-        if v is not None and (best is None or best[2] is None or v.score > best[2].score):
-            best = cand
         if v is not None and v.violations:
             last_violations = v.violations
 
     # ---------- 第 3 步：择优兜底 ----------
-    pool = [c for c in candidates if c[1]]
-    if not pool:
+    # 只在"经过判官复检"的候选中择优；若判官中途失灵导致全部候选未验证，按保证放行原文
+    verified = [c for c in candidates if c[1] and c[2] is not None]
+    attempts.append({"source": "fallback", "verified_candidates": len(verified)})
+    if not verified:
         return RepairResult(original_reply, first_verdict, False, "original", attempts)
 
     def sort_key(c):
         prio, _text, verdict = c
-        score = verdict.score if verdict else -1
-        return (-score, prio)
+        return (-verdict.score, prio)
 
-    top = min(pool, key=sort_key)
-    top_score = top[2].score if top[2] else -1
+    top = min(verified, key=sort_key)
+    top_score = top[2].score
     orig_score = first_verdict.score
     # 原回复分数更高时保留原文（修复反而变差的情形）
     if orig_score > top_score + 5:
         return RepairResult(original_reply, first_verdict, False, "original", attempts)
-    method = "best_effort"
-    return RepairResult(top[1], top[2], False, method, attempts)
+    return RepairResult(top[1], top[2], False, "best_effort", attempts)

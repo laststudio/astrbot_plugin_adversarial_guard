@@ -260,7 +260,7 @@ class AdversarialGuard(Star):
             history_block = build_history_block(
                 snap["contexts"],
                 exclude_prompt=user_msg,
-                max_turns=int(self.config.get("history_turns_for_judge") or 6),
+                max_turns=max(0, self._iget("history_turns_for_judge", 6, 0)),
             )
 
             verdict = await self._judge_once(event, persona, history_block, user_msg, reply)
@@ -270,7 +270,7 @@ class AdversarialGuard(Star):
 
             ok = is_pass(verdict, threshold)
             delta = self.ledger.record_check(
-                umo, ok, verdict.score, [] if ok else verdict.violations
+                umo, ok, verdict.score, [] if ok else verdict.violations, threshold
             )
             if ok:
                 logger.info(f"[{PLUGIN_NAME}] 审查通过 score={verdict.score} delta=+{delta}")
@@ -293,7 +293,7 @@ class AdversarialGuard(Star):
                 original_reply=reply,
                 first_verdict=verdict,
                 threshold=threshold,
-                max_regen_rounds=int(self.config.get("max_regen_rounds") or 2),
+                max_regen_rounds=max(0, self._iget("max_regen_rounds", 2, 0)),
             )
 
             final = (result.final_text or "").strip()
@@ -302,9 +302,13 @@ class AdversarialGuard(Star):
             self.ledger.record_repair(umo, result.ok, result.method)
             logger.info(f"[{PLUGIN_NAME}] 修复完成 method={result.method} ok={result.ok}")
             if bool(self.config.get("notify_on_fix", False)) and final != reply:
-                await self._send_notice(
-                    event, f"[守护] 已由判官A修正本次回复（method={result.method}）"
+                # 区分"已通过复检的修正"与"仅替换为更优版本但仍未过审"，避免误导用户
+                notice = (
+                    f"[守护] 已由判官A修正本次回复（method={result.method}）"
+                    if result.ok
+                    else f"[守护] 已尝试修正本次回复，但仍未完全通过审查（method={result.method}）"
                 )
+                await self._send_notice(event, notice)
         except Exception as e:
             logger.error(f"[{PLUGIN_NAME}] on_llm_response 异常(已忽略): {e}")
 
@@ -420,7 +424,7 @@ class AdversarialGuard(Star):
         status = (
             f"{HELP_TEXT}\n\n"
             f"当前状态：{'启用' if self._enabled_for(event) else '停用'}（会话级：{state}）\n"
-            f"策略：{self._action()}｜阈值：{self._threshold()}｜重生成上限：{self.config.get('max_regen_rounds')}\n"
+            f"策略：{self._action()}｜阈值：{self._threshold()}｜重生成上限：{max(0, self._iget('max_regen_rounds', 2, 0))}\n"
             f"判官模型：{str(self.config.get('judge_model') or '').strip() or '跟随主AI'}"
         )
         yield event.plain_result(status)

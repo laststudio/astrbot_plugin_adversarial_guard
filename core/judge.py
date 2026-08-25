@@ -111,8 +111,8 @@ def parse_verdict(raw: str) -> Verdict | None:
     rewrite = data.get("rewrite")
     rewrite = rewrite.strip() if isinstance(rewrite, str) else ""
     compliant = bool(data.get("compliant"))
-    # 自洽性兜底：声明合规但有违规条目时以违规为准
-    if violations and compliant and score < 60:
+    # 自洽性兜底：判官列出了违规条目时，以违规为准（与判官指令"存在明文违规即 false"一致）
+    if violations and compliant:
         compliant = False
     if not violations and not compliant and score >= 90:
         compliant = True

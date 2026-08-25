@@ -41,6 +41,8 @@ GAN 式双 AI 对抗人格守护插件。针对 AstrBot 主 AI（B）"不听话 
 | notify_on_fix | false | 修复后在聊天中发送提示 |
 
 > 成本提示：默认全量判定，每条 LLM 回复会增加一次判官调用。若使用主 AI 同款大模型，token 开销约翻倍；建议为判官配置便宜的小模型（judge_provider_id / judge_model）。
+>
+> 延迟提示：违规时修复流程（复检 + 最多 N 轮重生成）在回复送达前内联执行；按 judge_timeout=30s 的最坏情况，一条消息可能被阻塞数分钟。对延迟敏感的场景可调低 judge_timeout 或改用 record_only 策略。
 
 ## 指令
 

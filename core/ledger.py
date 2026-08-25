@@ -52,14 +52,16 @@ class Ledger:
         self.window = max(1, int(window))
 
     # ------------------------------------------------------------------ 记账
-    def record_check(self, umo: str, ok: bool, score: int, violations: list) -> float:
+    def record_check(
+        self, umo: str, ok: bool, score: int, violations: list, threshold: int = 70
+    ) -> float:
         """记录一次审查结果。违规按 severity 合计扣分；合规按分数盈余加分。
 
         返回本次变动 delta。
         """
         total_sev = sum(int(v.get("severity", 1)) for v in violations)
         if ok:
-            delta = round(max(0.0, (int(score) - 70) / 10), 2)
+            delta = round(max(0.0, (int(score) - int(threshold)) / 10), 2)
         else:
             delta = -max(1, min(10, total_sev if total_sev > 0 else 1))
         rules = []
