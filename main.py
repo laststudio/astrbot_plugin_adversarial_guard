@@ -47,7 +47,6 @@ from .core.rules import (
     build_extract_prompt,
     parse_rules,
     render_rules_block,
-    rule_id_of,
 )
 from .core.summarizer import (
     SUMMARY_SYSTEM_PROMPT,
