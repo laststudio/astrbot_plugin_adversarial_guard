@@ -157,7 +157,9 @@ class AdversarialGuard(Star):
 
     def _iget(self, key: str, default: int, lo: int | None = None, hi: int | None = None) -> int:
         try:
-            val = int(self.config.get(key) or default)
+            # 注意：不能用 `or default`——显式配置 0（如抽样率 0、熔断阈值 0）会被 falsy 吞掉
+            raw = self.config.get(key, default)
+            val = int(raw)
         except (TypeError, ValueError):
             val = int(default)
         if lo is not None:
@@ -168,7 +170,8 @@ class AdversarialGuard(Star):
 
     def _fget(self, key: str, default: float) -> float:
         try:
-            return float(self.config.get(key) or default)
+            raw = self.config.get(key, default)
+            return float(raw)
         except (TypeError, ValueError):
             return float(default)
 
@@ -749,6 +752,14 @@ class AdversarialGuard(Star):
         try:
             if not bool(self.config.get("human_feedback_enabled", False)):
                 return
+            # 过滤 bot 自己的消息（bot 回复中含反馈词时不得误记账）
+            try:
+                self_id = str(event.get_self_id() or "")
+                sender_id = str(event.get_sender_id() or "")
+                if self_id and sender_id and self_id == sender_id:
+                    return
+            except Exception:
+                pass
             if self._pending.get(id(event)):
                 return  # 本消息自身会触发 LLM（命令/唤醒），不算反馈
             text = (getattr(event, "message_str", "") or "").strip()
