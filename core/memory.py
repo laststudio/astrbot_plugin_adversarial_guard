@@ -134,8 +134,8 @@ class MemoryStore:
         )[: max(1, max_lines)]
         lines = [
             "<guard_memory>",
-            "[长期记忆·判官A确认的行为教训] 你在过去对话中曾反复出现以下问题，"
-            "本轮回复务必逐条规避：",
+            ("[长期记忆·判官A确认的行为教训] 你在过去对话中曾反复出现以下问题，"
+             "本轮回复务必逐条规避："),
         ]
         for i, e in enumerate(ranked, 1):
             rule = str(e.get("rule", ""))

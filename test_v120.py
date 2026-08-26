@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """v1.2.0 本地测试：规则库提取/存取、ledger 趋势/熔断/人工反馈、抽样与缓存。"""
 
 import json
@@ -9,7 +8,8 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from core.rules import (  # noqa: E402
+from core.ledger import Ledger
+from core.rules import (
     RulesStore,
     build_extract_prompt,
     parse_rules,
@@ -17,7 +17,6 @@ from core.rules import (  # noqa: E402
     render_rules_block,
     rule_id_of,
 )
-from core.ledger import Ledger  # noqa: E402
 
 
 class TestParseRules(unittest.TestCase):

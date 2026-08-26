@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """v1.2.0 main 层逻辑测试：豁免名单、抽样、缓存、熔断、人工反馈 self 过滤。
 
 不连接真实 LLM，全部 mock。
@@ -14,8 +13,9 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from astrbot_plugin_adversarial_guard.main import AdversarialGuard  # noqa: E402
-from core.judge import Verdict  # noqa: E402
+from astrbot_plugin_adversarial_guard.main import AdversarialGuard
+
+from core.judge import Verdict
 
 
 def make_plugin(config=None):

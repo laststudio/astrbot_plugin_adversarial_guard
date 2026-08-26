@@ -41,6 +41,11 @@ from .core.judge import (
 )
 from .core.ledger import Ledger
 from .core.memory import MemoryStore
+from .core.repair import (
+    ACTION_FAST_FIX_THEN_REGEN,
+    ACTION_RECORD_ONLY,
+    run_adversarial_repair,
+)
 from .core.rules import (
     EXTRACT_SYSTEM_PROMPT,
     RulesStore,
@@ -49,18 +54,13 @@ from .core.rules import (
     render_rules_block,
 )
 from .core.summarizer import (
-    SUMMARY_SYSTEM_PROMPT,
     REVIEW_SYSTEM_PROMPT,
+    SUMMARY_SYSTEM_PROMPT,
     build_review_prompt,
     build_summary_prompt,
     parse_review,
     parse_summary,
     resolve_entry,
-)
-from .core.repair import (
-    ACTION_FAST_FIX_THEN_REGEN,
-    ACTION_RECORD_ONLY,
-    run_adversarial_repair,
 )
 
 PLUGIN_NAME = "astrbot_plugin_adversarial_guard"
@@ -407,7 +407,7 @@ class AdversarialGuard(Star):
                 return
             self.rules_store.set_rules(umo, persona, rules)
             logger.info(f"[{PLUGIN_NAME}] 规则库已提取 {len(rules)} 条（{umo}）")
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.debug(f"[{PLUGIN_NAME}] 规则提取任务异常（已忽略）: {e}")
         finally:
             if getattr(self, "_rules_extracting", None) == umo:
@@ -651,7 +651,7 @@ class AdversarialGuard(Star):
             logger.info(
                 f"[{PLUGIN_NAME}] 长期记忆已更新：{saved['rule']}（累计 {saved['count']} 次）"
             )
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.debug(f"[{PLUGIN_NAME}] 长期记忆总结任务异常（已忽略）: {e}")
 
     # =========================================================== 内部流程
@@ -790,7 +790,7 @@ class AdversarialGuard(Star):
             delta = self.ledger.record_human_feedback(umo, positive)
             kind = "正面" if positive else "负面"
             logger.info(f"[{PLUGIN_NAME}] 人工{kind}反馈（{text[:20]}）delta={delta}")
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.debug(f"[{PLUGIN_NAME}] 人工反馈处理异常（已忽略）: {e}")
 
     @filter.command("guard")

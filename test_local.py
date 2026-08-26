@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """v1.1.0 长期记忆功能本地测试：MemoryStore、总结/复审解析、注入渲染。
 
 不依赖 AstrBot 运行时，纯本地单测。
@@ -13,8 +12,8 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from core.memory import MemoryStore  # noqa: E402
-from core.summarizer import (  # noqa: E402
+from core.memory import MemoryStore
+from core.summarizer import (
     build_review_prompt,
     build_summary_prompt,
     parse_review,
