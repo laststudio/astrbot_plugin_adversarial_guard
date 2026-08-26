@@ -80,8 +80,84 @@ class Ledger:
                     s["rule_counts"][r] = s["rule_counts"].get(r, 0) + 1
             s["recent"].append({"t": time.time(), "ok": ok, "rules": rules, "score": int(score)})
             del s["recent"][:-RECENT_CAP]
+            # v1.2.0：连续违规计数（修复熔断依据）+ 每日趋势
+            if not ok:
+                s["violate_streak"] = int(s.get("violate_streak", 0)) + 1
+            else:
+                s["violate_streak"] = 0
+            daily = s.setdefault("daily", {})
+            today = time.strftime("%Y-%m-%d")
+            day = daily.setdefault(today, {"checked": 0, "violated": 0})
+            day["checked"] = int(day.get("checked", 0)) + 1
+            if not ok:
+                day["violated"] = int(day.get("violated", 0)) + 1
+            # 保留最近 7 天
+            cutoff = time.strftime(
+                "%Y-%m-%d", time.localtime(time.time() - 8 * 86400)
+            )
+            for d in [k for k in daily if k < cutoff]:
+                del daily[d]
             self.save()
         return delta
+
+    def violate_streak(self, umo: str) -> int:
+        """当前连续违规次数（合规即清零）。"""
+        with self._lock:
+            s = self._data.get("sessions", {}).get(umo)
+            return int(s.get("violate_streak", 0)) if s else 0
+
+    def record_human_feedback(self, umo: str, positive: bool) -> float:
+        """人工反馈奖惩（v1.2.0）：用户对回复的口头正/负反馈计入纪律分。
+
+        负反馈 -2，正反馈 +1。返回 delta。
+        """
+        delta = 1.0 if positive else -2.0
+        with self._lock:
+            s = self._session(umo)
+            s["reward"] = round(s["reward"] + delta, 2)
+            fb = s.setdefault("human_feedback", {"pos": 0, "neg": 0})
+            fb["pos" if positive else "neg"] = int(fb.get("pos" if positive else "neg", 0)) + 1
+            self.save()
+        return delta
+
+    def human_feedback_stats(self, umo: str) -> dict:
+        with self._lock:
+            s = self._data.get("sessions", {}).get(umo)
+            if not s:
+                return {"pos": 0, "neg": 0}
+            fb = s.get("human_feedback") or {}
+            return {"pos": int(fb.get("pos", 0)), "neg": int(fb.get("neg", 0))}
+
+    def daily_trend(self, umo: str, days: int = 7) -> list[tuple[str, int, int]]:
+        """返回近 N 天趋势 [(MM-DD, checked, violated)]（缺数据日补零）。"""
+        with self._lock:
+            s = self._data.get("sessions", {}).get(umo)
+            daily = dict(s.get("daily") or {}) if s else {}
+        out = []
+        now = time.time()
+        for i in range(days - 1, -1, -1):
+            ts = now - i * 86400
+            key = time.strftime("%Y-%m-%d", time.localtime(ts))
+            label = time.strftime("%m-%d", time.localtime(ts))
+            day = daily.get(key) or {}
+            out.append((
+                label,
+                int(day.get("checked", 0)),
+                int(day.get("violated", 0)),
+            ))
+        return out
+
+    def set_fused_until(self, umo: str, until_ts: float) -> None:
+        """修复熔断：到 ts 之前强制 record_only。"""
+        with self._lock:
+            s = self._session(umo)
+            s["fused_until"] = float(until_ts)
+            self.save()
+
+    def fused_until(self, umo: str) -> float:
+        with self._lock:
+            s = self._data.get("sessions", {}).get(umo)
+            return float(s.get("fused_until", 0)) if s else 0.0
 
     def record_repair(self, umo: str, success: bool, method: str) -> None:
         """记录一次修复尝试的最终结果（不重复计分，仅统计与更新最近快照）。"""
@@ -128,6 +204,17 @@ class Ledger:
         )
 
     # ---------------------------------------------------------------- 查询
+    def get_reward(self, umo: str) -> float:
+        """读取会话当前纪律分（无会话记录返回 0.0）。"""
+        with self._lock:
+            s = self._data.get("sessions", {}).get(umo)
+            if not s:
+                return 0.0
+            try:
+                return float(s.get("reward", 0.0))
+            except (TypeError, ValueError):
+                return 0.0
+
     def stats_text(self, umo: str, top_n: int = 5) -> str:
         with self._lock:
             s = self._session(umo)
