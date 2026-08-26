@@ -69,5 +69,36 @@
     "description": "修复成功后是否在聊天中发送一条简短提示（默认关闭，仅记录日志）。",
     "type": "bool",
     "default": false
+  },
+  "memory_enabled": {
+    "description": "长期记忆总开关：审查发现违规后，由总结模型(C)提炼教训、判官(A)复审，写入持久 memory.json 供后续轮次注入。",
+    "type": "bool",
+    "default": true
+  },
+  "memory_injection": {
+    "description": "主 AI 每轮请求前是否注入 <guard_memory> 长期教训块（与 feedback_injection 的窗口反馈互补）。",
+    "type": "bool",
+    "default": true
+  },
+  "summarizer_provider_id": {
+    "description": "总结模型(C) 的提供商 ID。留空 = 回退判官提供商。",
+    "type": "string",
+    "default": "",
+    "hint": "建议同样配置便宜的小模型，控制成本"
+  },
+  "summarizer_model": {
+    "description": "总结模型(C) 强制使用的模型名。留空 = 使用提供商默认模型。",
+    "type": "string",
+    "default": ""
+  },
+  "memory_max_entries": {
+    "description": "每会话长期记忆条目上限（1-100），同规则教训合并演进不重复堆积。",
+    "type": "int",
+    "default": 20
+  },
+  "summary_review_enabled": {
+    "description": "是否由判官(A)对总结草稿做三维复审（忠实性/简洁性/隐私过滤）。关闭后草稿直接写入。",
+    "type": "bool",
+    "default": true
   }
 }

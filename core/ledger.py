@@ -128,6 +128,17 @@ class Ledger:
         )
 
     # ---------------------------------------------------------------- 查询
+    def get_reward(self, umo: str) -> float:
+        """读取会话当前纪律分（无会话记录返回 0.0）。"""
+        with self._lock:
+            s = self._data.get("sessions", {}).get(umo)
+            if not s:
+                return 0.0
+            try:
+                return float(s.get("reward", 0.0))
+            except (TypeError, ValueError):
+                return 0.0
+
     def stats_text(self, umo: str, top_n: int = 5) -> str:
         with self._lock:
             s = self._session(umo)

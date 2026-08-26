@@ -35,6 +35,16 @@ from .core.judge import (
     parse_verdict,
 )
 from .core.ledger import Ledger
+from .core.memory import MemoryStore
+from .core.summarizer import (
+    SUMMARY_SYSTEM_PROMPT,
+    REVIEW_SYSTEM_PROMPT,
+    build_review_prompt,
+    build_summary_prompt,
+    parse_review,
+    parse_summary,
+    resolve_entry,
+)
 from .core.repair import (
     ACTION_FAST_FIX_THEN_REGEN,
     ACTION_RECORD_ONLY,
@@ -47,10 +57,12 @@ PENDING_CAP = 200  # 快照字典容量上限
 PERSONA_CACHE_CAP = 100  # 每个 umo 缓存的最近人格提示词条数
 
 HELP_TEXT = (
-    "对抗人格守护（判官A × 主AI B）\n"
+    "对抗人格守护（判官A × 主AI B × 记忆C）\n"
     "/guard - 查看状态与帮助\n"
     "/guard on|off - 本会话开关审查\n"
     "/guard stats - 查看奖惩统计\n"
+    "/guard memory - 查看本会话长期记忆（C总结+A复审的教训）\n"
+    "/guard forget <序号|all> - 删除长期记忆（管理员）\n"
     "/guard test <文本> - 让判官A审查指定文本\n"
     "/guard reset - 清空本会话账本（管理员）"
 )
@@ -89,6 +101,13 @@ class AdversarialGuard(Star):
             decay=self._fget("reward_decay", 0.8),
             window=max(1, self._iget("feedback_window", 5, 1)),
         )
+        # v1.1.0：长期记忆（C 总结 + A 复审后的教训条目）
+        self.memory = MemoryStore(
+            path=os.path.join(data_dir, "memory.json"),
+            max_entries=self._iget("memory_max_entries", 20, 1, 100),
+        )
+        # 后台总结任务集合（插件卸载时等待收尾）
+        self._summary_tasks: set = set()
         self._pending: dict[int, dict] = {}  # id(event) -> 请求快照
         self._last_persona: dict[str, str] = {}  # umo -> 最近一次人格提示词
 
@@ -213,19 +232,29 @@ class AdversarialGuard(Star):
                 if len(self._last_persona) > PERSONA_CACHE_CAP:
                     self._last_persona.pop(next(iter(self._last_persona)))
 
+            # v1.1.0：长期记忆注入（C 总结、A 复审过的教训条目），先于窗口反馈
+            if bool(self.config.get("memory_injection", True)):
+                memory_text = MemoryStore.render_entries(self.memory.entries(umo))
+                if memory_text:
+                    self._inject_text(req, persona, memory_text)
+
             if not bool(self.config.get("feedback_injection", True)):
                 return
             feedback = self.ledger.injection_text(umo, self._threshold())
             if not feedback:
                 return
-            parts = getattr(req, "extra_user_content_parts", None)
-            if parts is not None and TextPart is not None:
-                parts.append(TextPart(text=feedback).mark_as_temp())
-            elif persona is not None:
-                # 旧版本兜底：追加到 system_prompt（可能影响提示词缓存）
-                req.system_prompt = persona + "\n" + feedback
+            self._inject_text(req, persona, feedback)
         except Exception as e:
             logger.error(f"[{PLUGIN_NAME}] on_llm_request 异常(已忽略): {e}")
+
+    @staticmethod
+    def _inject_text(req: ProviderRequest, persona: str, text: str) -> None:
+        """把附加文本注入请求：优先临时内容块（不写入历史、不破坏缓存），旧版回退 system_prompt。"""
+        parts = getattr(req, "extra_user_content_parts", None)
+        if parts is not None and TextPart is not None:
+            parts.append(TextPart(text=text).mark_as_temp())
+        elif persona is not None:
+            req.system_prompt = persona + "\n" + text
 
     @filter.on_llm_response()
     async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):
@@ -309,8 +338,151 @@ class AdversarialGuard(Star):
                     else f"[守护] 已尝试修正本次回复，但仍未完全通过审查（method={result.method}）"
                 )
                 await self._send_notice(event, notice)
+
+            # v1.1.0：后台异步总结（C 生成教训 → A 三维复审 → 写入长期记忆）
+            if (
+                bool(self.config.get("memory_enabled", True))
+                and self.ledger is not None
+            ):
+                task = asyncio.create_task(
+                    self._summarize_and_store(
+                        event, verdict_dict=self._verdict_to_dict(verdict),
+                        repair_info={
+                            "method": result.method,
+                            "ok": result.ok,
+                            "attempts": result.attempts,
+                        },
+                        reward=self.ledger.get_reward(umo),
+                    )
+                )
+                self._summary_tasks.add(task)
+                task.add_done_callback(self._summary_tasks.discard)
         except Exception as e:
             logger.error(f"[{PLUGIN_NAME}] on_llm_response 异常(已忽略): {e}")
+
+    # ================================================== 长期记忆：总结与复审
+    @staticmethod
+    def _verdict_to_dict(v) -> dict:
+        """把 Verdict 裁决压缩为可序列化摘要（供总结/复审提示词使用）。"""
+        return {
+            "compliant": bool(v.compliant),
+            "score": int(v.score),
+            "violations": [
+                {
+                    "rule": x.get("rule", ""),
+                    "evidence": x.get("evidence", ""),
+                    "severity": x.get("severity", 1),
+                }
+                for x in (v.violations or [])
+            ],
+        }
+
+    def _refresh_memory_params(self) -> None:
+        self.memory.set_max_entries(self._iget("memory_max_entries", 20, 1, 100))
+
+    async def _chat_text_with(
+        self, event: AstrMessageEvent, provider_kind: str,
+        system_prompt: str, prompt: str,
+    ) -> str:
+        """按 provider_kind（judge/summarizer）选择模型并调用，返回文本。
+
+        - summarizer：优先 summarizer_provider_id/summarizer_model，
+          未配置时回退判官提供商；
+        - judge：判官提供商 + judge_model。
+        """
+        if provider_kind == "summarizer":
+            pid = str(self.config.get("summarizer_provider_id") or "").strip()
+            model = str(self.config.get("summarizer_model") or "").strip()
+            provider = None
+            if pid:
+                try:
+                    provider = self.context.get_provider_by_id(pid)
+                except Exception:
+                    provider = None
+                if provider is None:
+                    logger.warning(
+                        f"[{PLUGIN_NAME}] 总结 provider_id '{pid}' 无效，回退判官/主提供商"
+                    )
+            if provider is None:
+                provider = await self._get_judge_provider(event)
+        else:
+            provider = await self._get_judge_provider(event)
+            model = str(self.config.get("judge_model") or "").strip()
+        if provider is None:
+            raise RuntimeError("无可用提供商")
+        kwargs = {
+            "prompt": prompt,
+            "contexts": [],
+            "system_prompt": system_prompt,
+        }
+        if model:
+            kwargs["model"] = model
+        resp = await provider.text_chat(**kwargs)
+        return (getattr(resp, "completion_text", "") or "").strip()
+
+    async def _summarize_and_store(
+        self, event: AstrMessageEvent, verdict_dict: dict,
+        repair_info: dict, reward: float,
+    ) -> None:
+        """后台任务：C 总结教训 → A 三维复审（忠实/简洁/隐私）→ 写入长期记忆。
+
+        任一环节失败均静默丢弃本轮（fail-open），绝不影响正常聊天。
+        """
+        umo = event.unified_msg_origin
+        try:
+            self._refresh_memory_params()
+            timeout = self._timeout()
+            # ---- 1) C：生成教训草稿 ----
+            prompt = build_summary_prompt(verdict_dict, repair_info, reward)
+            try:
+                raw = await asyncio.wait_for(
+                    self._chat_text_with(event, "summarizer", SUMMARY_SYSTEM_PROMPT, prompt),
+                    timeout=timeout,
+                )
+            except Exception as e:
+                logger.debug(f"[{PLUGIN_NAME}] 总结模型调用失败（本轮不写记忆）: {e}")
+                return
+            draft = parse_summary(raw)
+            if draft is None:
+                logger.debug(f"[{PLUGIN_NAME}] 总结输出不可用（keep=false 或解析失败），本轮不写记忆")
+                return
+            draft["meta"] = {"score": verdict_dict.get("score")}
+
+            # ---- 2) A：三维复审（忠实性/简洁性/隐私） ----
+            entry: dict | None
+            if bool(self.config.get("summary_review_enabled", True)):
+                review_prompt = build_review_prompt(verdict_dict, repair_info, draft)
+                try:
+                    raw = await asyncio.wait_for(
+                        self._chat_text_with(event, "judge", REVIEW_SYSTEM_PROMPT, review_prompt),
+                        timeout=timeout,
+                    )
+                except Exception as e:
+                    logger.debug(f"[{PLUGIN_NAME}] 记忆复审调用失败，信任草稿写入: {e}")
+                    review = None
+                else:
+                    review = parse_review(raw)
+                    if review is None:
+                        logger.debug("[{PLUGIN_NAME}] 复审输出解析失败，本轮不写记忆")
+                        return
+                entry = resolve_entry(draft, review)
+                if entry is None:
+                    logger.info(f"[{PLUGIN_NAME}] 教训草稿被复审驳回（{review.get('reason', '未说明')}），已丢弃")
+                    return
+                if entry.get("meta", {}).get("corrected"):
+                    logger.info(f"[{PLUGIN_NAME}] 教训草稿经复审修正后写入")
+            else:
+                entry = resolve_entry(draft, None)
+
+            # ---- 3) 写入长期记忆 ----
+            saved = self.memory.add(
+                umo, rule=entry["rule"], lesson=entry["lesson"], meta=entry.get("meta"),
+            )
+            logger.info(
+                f"[{PLUGIN_NAME}] 长期记忆已更新：{saved['rule']}（累计 {saved['count']} 次）"
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[{PLUGIN_NAME}] 长期记忆总结任务异常（已忽略）: {e}")
 
     # =========================================================== 内部流程
     async def _judge_once(
@@ -402,6 +574,51 @@ class AdversarialGuard(Star):
         if sub == "stats":
             yield event.plain_result(f"会话奖惩统计：\n{self.ledger.stats_text(umo)}")
             return
+        if sub == "memory":
+            self._refresh_memory_params()
+            entries = self.memory.entries(umo)
+            if not entries:
+                yield event.plain_result("本会话暂无长期记忆条目。违规经总结与复审后会自动积累。")
+                return
+            ranked = sorted(
+                entries,
+                key=lambda e: (-int(e.get("count", 1)), -float(e.get("ts", 0))),
+            )
+            lines = [f"本会话长期记忆（共 {len(ranked)} 条，注入时按次数取前 8 条）："]
+            for i, e in enumerate(ranked, 1):
+                corrected = "（复审修正版）" if (e.get("meta") or {}).get("corrected") else ""
+                lines.append(
+                    f"{i}. {e.get('rule', '')} ×{e.get('count', 1)}{corrected}\n"
+                    f"   └ {e.get('lesson', '')}"
+                )
+            yield event.plain_result("\n".join(lines))
+            return
+        if sub == "forget":
+            if not _is_admin(event):
+                yield event.plain_result("该操作需要管理员权限。")
+                return
+            arg = parts[2] if len(parts) > 2 else ""
+            if arg == "all":
+                self.memory.clear(umo)
+                yield event.plain_result("已清空本会话的全部长期记忆。")
+                return
+            if arg.isdigit():
+                entries = sorted(
+                    self.memory.entries(umo),
+                    key=lambda e: (-int(e.get("count", 1)), -float(e.get("ts", 0))),
+                )
+                idx = int(arg)
+                if idx < 1 or idx > len(entries):
+                    yield event.plain_result(f"序号超出范围（1-{len(entries)}），可先发送 /guard memory 查看。")
+                    return
+                target = entries[idx - 1]
+                # remove 按 entries 存储顺序索引；此处按展示序号定位到存储序号
+                store_idx = self.memory.entries(umo).index(target) + 1
+                self.memory.remove(umo, store_idx)
+                yield event.plain_result(f"已删除长期记忆：{target.get('rule', '')}")
+                return
+            yield event.plain_result("用法：/guard forget <序号|all>（序号见 /guard memory）")
+            return
         if sub == "reset":
             if not _is_admin(event):
                 yield event.plain_result("该操作需要管理员权限。")
@@ -452,8 +669,18 @@ class AdversarialGuard(Star):
         yield event.plain_result("\n".join(lines))
 
     async def terminate(self):
-        """插件卸载/停用时持久化账本。"""
+        """插件卸载/停用时等待后台总结任务收尾并持久化账本与长期记忆。"""
+        try:
+            tasks = [t for t in self._summary_tasks if not t.done()]
+            if tasks:
+                await asyncio.wait(tasks, timeout=10)
+        except Exception:
+            pass
         try:
             self.ledger.save()
+        except Exception:
+            pass
+        try:
+            self.memory.save()
         except Exception:
             pass
