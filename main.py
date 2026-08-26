@@ -10,11 +10,16 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import os
+import random
+import re
 import time
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event.filter import EventMessageType
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star
 
@@ -36,6 +41,14 @@ from .core.judge import (
 )
 from .core.ledger import Ledger
 from .core.memory import MemoryStore
+from .core.rules import (
+    EXTRACT_SYSTEM_PROMPT,
+    RulesStore,
+    build_extract_prompt,
+    parse_rules,
+    render_rules_block,
+    rule_id_of,
+)
 from .core.summarizer import (
     SUMMARY_SYSTEM_PROMPT,
     REVIEW_SYSTEM_PROMPT,
@@ -60,7 +73,9 @@ HELP_TEXT = (
     "对抗人格守护（判官A × 主AI B × 记忆C）\n"
     "/guard - 查看状态与帮助\n"
     "/guard on|off - 本会话开关审查\n"
-    "/guard stats - 查看奖惩统计\n"
+    "/guard stats - 查看奖惩统计与近 7 天趋势\n"
+    "/guard rules - 查看本会话规则库（判官逐条对照）\n"
+    "/guard patch - 根据高频违规生成人格补丁建议（管理员）\n"
     "/guard memory - 查看本会话长期记忆（C总结+A复审的教训）\n"
     "/guard forget <序号|all> - 删除长期记忆（管理员）\n"
     "/guard test <文本> - 让判官A审查指定文本\n"
@@ -108,6 +123,11 @@ class AdversarialGuard(Star):
         )
         # 后台总结任务集合（插件卸载时等待收尾）
         self._summary_tasks: set = set()
+        # v1.2.0：规则库 + 审查缓存 + 人工反馈冷却
+        self.rules_store = RulesStore(path=os.path.join(data_dir, "rules.json"))
+        self._review_cache: dict[tuple, dict] = {}  # (persona_hash, reply_hash) -> verdict dict
+        self._last_reply_ts: dict[str, float] = {}  # umo -> 最近一次被审回复时间
+        self._fb_last: dict[str, float] = {}  # umo -> 上次人工反馈记账时间
         self._pending: dict[int, dict] = {}  # id(event) -> 请求快照
         self._last_persona: dict[str, str] = {}  # umo -> 最近一次人格提示词
 
@@ -217,6 +237,10 @@ class AdversarialGuard(Star):
             contexts = list(getattr(req, "contexts", None) or [])
             persona = getattr(req, "system_prompt", "") or ""
 
+            # v1.2.0：豁免名单（指令前缀/用户/正则）——命中则本轮不审查（不存快照）
+            if self._is_exempt_from_review(event, prompt_text):
+                return
+
             # 先存干净快照（供判官使用），再做注入，避免判官看到反馈文本本身
             self._pending[id(event)] = {
                 "persona": persona,
@@ -231,6 +255,12 @@ class AdversarialGuard(Star):
                 self._last_persona[umo] = persona
                 if len(self._last_persona) > PERSONA_CACHE_CAP:
                     self._last_persona.pop(next(iter(self._last_persona)))
+                # v1.2.0：规则库为空或 persona 变化 → 后台重新提取（不阻塞）
+                if (
+                    bool(self.config.get("rules_extract_enabled", True))
+                    and self.rules_store.is_stale(umo, persona)
+                ):
+                    self._schedule_rules_extract(event, persona)
 
             # v1.1.0：长期记忆注入（C 总结、A 复审过的教训条目），先于窗口反馈
             if bool(self.config.get("memory_injection", True)):
@@ -255,6 +285,131 @@ class AdversarialGuard(Star):
             parts.append(TextPart(text=text).mark_as_temp())
         elif persona is not None:
             req.system_prompt = persona + "\n" + text
+
+    # ================================================== v1.2.0 豁免/抽样/缓存
+    def _is_exempt_from_review(self, event: AstrMessageEvent, prompt_text: str) -> bool:
+        """豁免名单：指令前缀 / 用户 ID / 正则 任一命中则本轮不审查。"""
+        text = (getattr(event, "message_str", "") or "").strip()
+        prefixes = [
+            x.strip() for x in str(self.config.get("exempt_prefixes", "") or "").replace("，", ",").split(",")
+            if x.strip()
+        ]
+        for p in prefixes:
+            if text.startswith(p) or prompt_text.startswith(p):
+                return True
+        users = {
+            x.strip() for x in str(self.config.get("exempt_users", "") or "").replace("，", ",").split(",")
+            if x.strip()
+        }
+        if users:
+            try:
+                if str(event.get_sender_id() or "") in users:
+                    return True
+            except Exception:
+                pass
+        patterns_raw = str(self.config.get("exempt_patterns", "") or "").replace("，", ",")
+        for p in [x.strip() for x in patterns_raw.split(",") if x.strip()]:
+            try:
+                if re.search(p, text) or re.search(p, prompt_text):
+                    return True
+            except re.error:
+                continue
+        return False
+
+    def _should_review_this_round(self) -> bool:
+        """审查抽样：review_sample_rate 0-100（默认 100 全量）。"""
+        rate = self._iget("review_sample_rate", 100, 0, 100)
+        if rate >= 100:
+            return True
+        if rate <= 0:
+            return False
+        return random.random() * 100 < rate
+
+    @staticmethod
+    def _reply_hash(text: str, persona: str) -> tuple:
+        return (
+            hashlib.md5((persona or "").encode("utf-8")).hexdigest(),
+            hashlib.md5((text or "").encode("utf-8")).hexdigest(),
+        )
+
+    def _cache_get_verdict(self, reply: str, persona: str) -> Verdict | None:
+        if not bool(self.config.get("review_cache_enabled", True)):
+            return None
+        import time as _t
+        entry = self._review_cache.get(self._reply_hash(reply, persona))
+        if not entry:
+            return None
+        if _t.time() - entry["ts"] > 3600:
+            self._review_cache.pop(self._reply_hash(reply, persona), None)
+            return None
+        v = entry["verdict"]
+        logger.info(f"[{PLUGIN_NAME}] 审查缓存命中，复用裁决 score={v.score}")
+        return v
+
+    def _cache_put_verdict(self, reply: str, persona: str, verdict: Verdict) -> None:
+        if not bool(self.config.get("review_cache_enabled", True)):
+            return
+        if len(self._review_cache) > 200:
+            self._review_cache.clear()
+        self._review_cache[self._reply_hash(reply, persona)] = {
+            "ts": time.time(),
+            "verdict": verdict,
+        }
+
+    # ================================================== v1.2.0 修复熔断
+    def _effective_action_with_fuse(self, umo: str) -> str:
+        """修复熔断：连续违规达到阈值后，冷却期内强制 record_only，避免修复风暴。"""
+        action = self._action()
+        threshold = self._iget("fuse_threshold", 0, 0, 100)
+        if threshold <= 0:
+            return action
+        fused_until = self.ledger.fused_until(umo)
+        if fused_until > time.time():
+            return ACTION_RECORD_ONLY
+        if self.ledger.violate_streak(umo) >= threshold:
+            minutes = self._iget("fuse_cooldown_minutes", 10, 1, 1440)
+            self.ledger.set_fused_until(umo, time.time() + minutes * 60)
+            logger.warning(
+                f"[{PLUGIN_NAME}] 连续违规 {threshold} 次，修复熔断 {minutes} 分钟（强制 record_only）"
+            )
+            return ACTION_RECORD_ONLY
+        return action
+
+    # ================================================== v1.2.0 规则库提取
+    def _schedule_rules_extract(self, event: AstrMessageEvent, persona: str):
+        """后台提取人格规则清单（幂等：进行中不重复调度）。"""
+        umo = event.unified_msg_origin
+        if getattr(self, "_rules_extracting", None) == umo:
+            return
+        self._rules_extracting = umo
+        task = asyncio.create_task(self._extract_rules(event, persona))
+        self._summary_tasks.add(task)
+        task.add_done_callback(self._summary_tasks.discard)
+
+    async def _extract_rules(self, event: AstrMessageEvent, persona: str):
+        umo = event.unified_msg_origin
+        try:
+            prompt = build_extract_prompt(persona)
+            try:
+                raw = await asyncio.wait_for(
+                    self._chat_text_with(event, "summarizer", EXTRACT_SYSTEM_PROMPT, prompt),
+                    timeout=self._timeout(),
+                )
+            except Exception as e:
+                logger.debug(f"[{PLUGIN_NAME}] 规则提取调用失败: {e}")
+                return
+            rules = parse_rules(raw)
+            if not rules:
+                logger.debug(f"[{PLUGIN_NAME}] 人格中未提取到明文规则，本会话使用模糊对照")
+                self.rules_store.set_rules(umo, persona, [])
+                return
+            self.rules_store.set_rules(umo, persona, rules)
+            logger.info(f"[{PLUGIN_NAME}] 规则库已提取 {len(rules)} 条（{umo}）")
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[{PLUGIN_NAME}] 规则提取任务异常（已忽略）: {e}")
+        finally:
+            if getattr(self, "_rules_extracting", None) == umo:
+                self._rules_extracting = None
 
     @filter.on_llm_response()
     async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):
@@ -286,16 +441,28 @@ class AdversarialGuard(Star):
             threshold = self._threshold()
             persona = snap["persona"]
             user_msg = snap["prompt"]
+
+            # v1.2.0：审查抽样（省 token）
+            if not self._should_review_this_round():
+                logger.debug(f"[{PLUGIN_NAME}] 本轮抽样未命中，跳过审查（rate={self._iget('review_sample_rate', 100, 0, 100)}）")
+                return
+
             history_block = build_history_block(
                 snap["contexts"],
                 exclude_prompt=user_msg,
                 max_turns=max(0, self._iget("history_turns_for_judge", 6, 0)),
             )
 
-            verdict = await self._judge_once(event, persona, history_block, user_msg, reply)
+            # v1.2.0：审查缓存（同 persona + 同回复复用裁决）
+            verdict = self._cache_get_verdict(reply, persona)
+            if verdict is None:
+                verdict = await self._judge_once(event, persona, history_block, user_msg, reply)
+                if verdict is not None:
+                    self._cache_put_verdict(reply, persona, verdict)
             if verdict is None:
                 logger.warning(f"[{PLUGIN_NAME}] 判官不可用或输出无法解析，放行原文")
                 return
+            self._last_reply_ts[umo] = time.time()
 
             ok = is_pass(verdict, threshold)
             delta = self.ledger.record_check(
@@ -310,12 +477,13 @@ class AdversarialGuard(Star):
                 f"{format_violations(verdict.violations)}"
             )
 
+            # v1.2.0：修复熔断（连续违规达阈值 → 冷却期强制 record_only）
             result = await run_adversarial_repair(
                 chat_fn=self._make_chat_fn(event, snap),
                 judge_fn=lambda text: self._judge_once(
                     event, persona, history_block, user_msg, text
                 ),
-                action=self._action(),
+                action=self._effective_action_with_fuse(umo),
                 persona=persona,
                 contexts=snap["contexts"],
                 user_msg=user_msg,
@@ -493,13 +661,27 @@ class AdversarialGuard(Star):
         user_msg: str,
         reply: str,
     ) -> Verdict | None:
-        """调用判官 A 审查一段回复；任何失败返回 None。"""
+        """调用判官 A 审查一次回复；任何失败返回 None。
+
+        v1.2.0：会话规则库存在时，附加 [规则清单] 块供判官逐条对照（R1/R2/...）。
+        """
         provider = await self._get_judge_provider(event)
         if provider is None:
             return None
         limit = self._max_judge_chars()
         judged_reply = reply if len(reply) <= limit else reply[:limit] + "...(截断)"
         user_prompt = build_judge_user_prompt(persona, history_block, user_msg, judged_reply)
+        rules = self.rules_store.get(event.unified_msg_origin)
+        rules_block = render_rules_block(rules)
+        if rules_block:
+            # 规则清单插在人格提示词之后，判官可逐条对照
+            marker = "[近几轮对话]"
+            if marker in user_prompt:
+                user_prompt = user_prompt.replace(
+                    marker, rules_block + "\n\n" + marker, 1
+                )
+            else:
+                user_prompt = user_prompt + "\n\n" + rules_block
         try:
             raw = await asyncio.wait_for(
                 self._chat_text(provider, JUDGE_SYSTEM_PROMPT, user_prompt, use_judge_model=True),
@@ -558,6 +740,49 @@ class AdversarialGuard(Star):
             self._pending.pop(next(iter(self._pending)))
 
     # ============================================================= 指令
+    @filter.event_message_type(EventMessageType.ALL, priority=1)
+    async def human_feedback_listener(self, event: AstrMessageEvent):
+        """v1.2.0 人工反馈奖惩：用户口头正/负反馈计入纪律分（模拟 RLHF）。
+
+        仅在 bot 最近 120 秒内产生过被审回复时生效；每会话 60 秒冷却防刷。
+        """
+        try:
+            if not bool(self.config.get("human_feedback_enabled", False)):
+                return
+            if self._pending.get(id(event)):
+                return  # 本消息自身会触发 LLM（命令/唤醒），不算反馈
+            text = (getattr(event, "message_str", "") or "").strip()
+            if not text or len(text) > 30:
+                return
+            umo = event.unified_msg_origin
+            last = self._last_reply_ts.get(umo, 0)
+            now = time.time()
+            if now - last > 120:
+                return
+            if now - self._fb_last.get(umo, 0) < 60:
+                return
+            neg_words = [
+                x.strip() for x in str(self.config.get("feedback_negative_words", "不对,说错了,答错了,不是这样,胡说")).replace("，", ",").split(",")
+                if x.strip()
+            ]
+            pos_words = [
+                x.strip() for x in str(self.config.get("feedback_positive_words", "说得好,答对了,对了,不错,很棒")).replace("，", ",").split(",")
+                if x.strip()
+            ]
+            positive = None
+            if any(w in text for w in neg_words):
+                positive = False
+            elif any(w in text for w in pos_words):
+                positive = True
+            if positive is None:
+                return
+            self._fb_last[umo] = now
+            delta = self.ledger.record_human_feedback(umo, positive)
+            kind = "正面" if positive else "负面"
+            logger.info(f"[{PLUGIN_NAME}] 人工{kind}反馈（{text[:20]}）delta={delta}")
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[{PLUGIN_NAME}] 人工反馈处理异常（已忽略）: {e}")
+
     @filter.command("guard")
     async def guard_command(self, event: AstrMessageEvent):
         """/guard 主指令：查看状态或管理审查开关。"""
@@ -572,7 +797,44 @@ class AdversarialGuard(Star):
             yield event.plain_result(f"对抗人格守护已在当前会话{state}。")
             return
         if sub == "stats":
-            yield event.plain_result(f"会话奖惩统计：\n{self.ledger.stats_text(umo)}")
+            text = f"会话奖惩统计：\n{self.ledger.stats_text(umo)}"
+            fb = self.ledger.human_feedback_stats(umo)
+            if fb.get("pos") or fb.get("neg"):
+                text += f"\n人工反馈：正面 {fb['pos']} 次 / 负面 {fb['neg']} 次"
+            fused = self.ledger.fused_until(umo)
+            if fused > time.time():
+                text += f"\n🔥 修复熔断中：剩余约 {int((fused - time.time()) / 60) + 1} 分钟"
+            trend = self.ledger.daily_trend(umo, 7)
+            max_checked = max((c for _, c, _ in trend), default=0)
+            if max_checked > 0:
+                lines = ["", "📈 近 7 天审查趋势（█ 审查 / ▲ 违规率）"]
+                for label, checked, violated in trend:
+                    bars = max(1, round(checked / max_checked * 15)) if checked else 0
+                    rate = f"{violated / checked * 100:.0f}%" if checked else "-"
+                    lines.append(
+                        f"{label} {'█' * bars} {checked}次 违规率{rate}"
+                    )
+                text += "\n" + "\n".join(lines)
+            yield event.plain_result(text)
+            return
+        if sub == "rules":
+            rules = self.rules_store.get(umo)
+            if not rules:
+                yield event.plain_result(
+                    "本会话暂无规则库。与 bot 对话一次后自动从人格提示词提取（rules_extract_enabled）。\n"
+                    "无明文规则的人格可能提取为空，此时判官使用模糊对照。"
+                )
+                return
+            lines = [f"本会话规则库（共 {len(rules)} 条，判官逐条对照）："]
+            lines.extend(f"R{i}. {r}" for i, r in enumerate(rules, 1))
+            yield event.plain_result("\n".join(lines))
+            return
+        if sub == "patch":
+            if not _is_admin(event):
+                yield event.plain_result("该操作需要管理员权限。")
+                return
+            async for r in self._run_patch(event, umo):
+                yield r
             return
         if sub == "memory":
             self._refresh_memory_params()
@@ -645,6 +907,63 @@ class AdversarialGuard(Star):
             f"判官模型：{str(self.config.get('judge_model') or '').strip() or '跟随主AI'}"
         )
         yield event.plain_result(status)
+
+    async def _run_patch(self, event: AstrMessageEvent, umo: str):
+        """v1.2.0 人格补丁建议：基于高频违规 + 长期记忆，由 C 模型生成建议追加的人格条款。
+
+        治本思路：把规则写明确比事后修复更有效。输出建议文本供管理员自行合并到人格提示词。
+        """
+        persona = self._last_persona.get(umo, "")
+        rule_counts = {}
+        try:
+            s = self.ledger._data.get("sessions", {}).get(umo) or {}
+            rule_counts = dict(s.get("rule_counts") or {})
+        except Exception:
+            pass
+        memory_entries = self.memory.entries(umo)
+        if not rule_counts and not memory_entries:
+            yield event.plain_result("暂无违规记录，无需生成人格补丁。")
+            return
+        ranked = sorted(rule_counts.items(), key=lambda kv: -kv[1])[:8]
+        lessons = [f"- {e.get('lesson')}" for e in memory_entries[:6] if e.get("lesson")]
+        payload = {
+            "persona": persona[:4000],
+            "top_violations": [{"rule": r, "count": c} for r, c in ranked],
+            "memory_lessons": lessons,
+        }
+        system = (
+            "你是人格提示词顾问。给定一段 AI 人格提示词与该 AI 的高频违规记录，"
+            "请生成 3~6 条「建议追加到人格提示词末尾的补充条款」，用于从源头杜绝这些违规。"
+            "要求：每条一句话、明确可判定（禁止/必须句式）、与已有条款不重复；"
+            "只输出一个 JSON 对象：{\"patches\": [\"条款1\", ...]}，禁止 markdown 代码块与额外文字。"
+        )
+        prompt = json.dumps(payload, ensure_ascii=False)
+        try:
+            raw = await asyncio.wait_for(
+                self._chat_text_with(event, "summarizer", system, prompt),
+                timeout=self._timeout(),
+            )
+        except Exception as e:
+            yield event.plain_result(f"补丁生成失败（模型调用异常）：{e}")
+            return
+        data = None
+        try:
+            text = re.sub(r"^```[a-zA-Z]*\s*", "", raw.strip())
+            text = re.sub(r"\s*```$", "", text).strip()
+            start, end = text.find("{"), text.rfind("}")
+            data = json.loads(text[start : end + 1]) if start != -1 and end > start else None
+        except Exception:
+            data = None
+        patches = data.get("patches") if isinstance(data, dict) else None
+        if not isinstance(patches, list) or not patches:
+            yield event.plain_result("未能生成有效补丁建议，请稍后重试。")
+            return
+        lines = ["🩹 人格补丁建议（追加到人格提示词末尾）：", ""]
+        for i, p in enumerate(patches[:6], 1):
+            lines.append(f"{i}. {str(p).strip()}")
+        lines.append("")
+        lines.append("ℹ️ 复制以上条款合并到人格提示词保存后，规则库将自动重新提取。")
+        yield event.plain_result("\n".join(lines))
 
     async def _run_test(self, event: AstrMessageEvent, target: str):
         """用手动输入的文本模拟一次判官审查（以本会话最近的人格提示词为基准）。"""

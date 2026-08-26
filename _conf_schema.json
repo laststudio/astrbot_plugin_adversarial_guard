@@ -100,5 +100,60 @@
     "description": "是否由判官(A)对总结草稿做三维复审（忠实性/简洁性/隐私过滤）。关闭后草稿直接写入。",
     "type": "bool",
     "default": true
+  },
+  "rules_extract_enabled": {
+    "description": "规则库提取：用模型把人格提示词中的明文规则提取为编号清单（R1/R2/...），判官逐条对照提升准确率。人格变化时自动重新提取。",
+    "type": "bool",
+    "default": true
+  },
+  "review_sample_rate": {
+    "description": "审查抽样比例（0-100，默认 100 全量）。设为 30 表示仅 30% 的回复参与审查，大幅节省 token。",
+    "type": "int",
+    "default": 100
+  },
+  "review_cache_enabled": {
+    "description": "审查缓存：相同人格+相同回复内容 1 小时内复用裁决，不重复调用判官。",
+    "type": "bool",
+    "default": true
+  },
+  "exempt_prefixes": {
+    "description": "审查豁免指令前缀（英文逗号分隔）：以这些前缀开头的消息不参与审查，如 /af,/status。",
+    "type": "string",
+    "default": ""
+  },
+  "exempt_users": {
+    "description": "审查豁免用户 ID（英文逗号分隔）：这些用户触发的回复不参与审查。",
+    "type": "string",
+    "default": ""
+  },
+  "exempt_patterns": {
+    "description": "审查豁免正则（英文逗号分隔）：消息或用户消息命中任一正则则不审查。非法正则自动忽略。",
+    "type": "string",
+    "default": ""
+  },
+  "fuse_threshold": {
+    "description": "修复熔断阈值：连续违规达到该次数后进入冷却期强制 record_only（0=关闭熔断）。",
+    "type": "int",
+    "default": 0
+  },
+  "fuse_cooldown_minutes": {
+    "description": "修复熔断冷却分钟数（1-1440）。",
+    "type": "int",
+    "default": 10
+  },
+  "human_feedback_enabled": {
+    "description": "人工反馈奖惩：用户口头正/负反馈（如「说得好」「不对」）计入纪律分，模拟 RLHF。默认关闭避免误触发。",
+    "type": "bool",
+    "default": false
+  },
+  "feedback_negative_words": {
+    "description": "负反馈关键词（英文逗号分隔），命中计入 -2 分。",
+    "type": "string",
+    "default": "不对,说错了,答错了,不是这样,胡说"
+  },
+  "feedback_positive_words": {
+    "description": "正反馈关键词（英文逗号分隔），命中计入 +1 分。",
+    "type": "string",
+    "default": "说得好,答对了,对了,不错,很棒"
   }
 }
