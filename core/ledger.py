@@ -241,6 +241,39 @@ class Ledger:
             self._data.get("sessions", {}).pop(umo, None)
             self.save()
 
+    def global_summary(self, top_n: int = 5) -> dict:
+        """v1.3.0：跨会话汇总（定时报告用）。
+
+        返回 {"sessions": int, "checked": int, "violated": int, "fixed": int,
+              "rule_counts": {rule: count}, "worst": [(umo, violated), ...]}
+        """
+        with self._lock:
+            sessions = self._data.get("sessions", {})
+            checked = violated = fixed = 0
+            rule_counts: dict[str, int] = {}
+            per_session = []
+            for umo, s in sessions.items():
+                if not isinstance(s, dict):
+                    continue
+                c = int(s.get("total_checked", 0) or 0)
+                v = int(s.get("total_violated", 0) or 0)
+                checked += c
+                violated += v
+                fixed += int(s.get("total_fixed", 0) or 0)
+                for r, cnt in (s.get("rule_counts") or {}).items():
+                    rule_counts[r] = rule_counts.get(r, 0) + int(cnt or 0)
+                if c > 0:
+                    per_session.append((umo, v))
+            per_session.sort(key=lambda kv: -kv[1])
+        return {
+            "sessions": len(per_session),
+            "checked": checked,
+            "violated": violated,
+            "fixed": fixed,
+            "rule_counts": rule_counts,
+            "worst": per_session[:top_n],
+        }
+
     # ------------------------------------------------------------ 会话开关
     def set_toggle(self, umo: str, enabled: bool) -> None:
         with self._lock:
@@ -252,6 +285,31 @@ class Ledger:
         """返回会话级开关状态；None 表示未设置（跟随全局）。"""
         with self._lock:
             return self._data.get("toggles", {}).get(umo)
+
+    # -------------------------------------------------- 定时报告目标（v1.3.0）
+    def report_targets(self) -> list[str]:
+        with self._lock:
+            t = self._data.get("report_targets")
+            return [str(x) for x in t] if isinstance(t, list) else []
+
+    def add_report_target(self, umo: str) -> bool:
+        """注册定时报告目标；已存在返回 False。"""
+        with self._lock:
+            t = self._data.setdefault("report_targets", [])
+            if umo in t:
+                return False
+            t.append(str(umo))
+            self.save()
+            return True
+
+    def remove_report_target(self, umo: str) -> bool:
+        with self._lock:
+            t = self._data.get("report_targets") or []
+            if umo not in t:
+                return False
+            t.remove(umo)
+            self.save()
+            return True
 
     # ------------------------------------------------------------ 持久化
     def save(self) -> None:
