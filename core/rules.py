@@ -106,8 +106,12 @@ class RulesStore:
         sessions = self._data.setdefault("sessions", {})
         s = sessions.get(umo)
         if s is None:
-            s = {"rules": [], "persona_hash": "", "updated_at": 0.0}
+            s = {"rules": [], "manual_flags": [], "persona_hash": "", "updated_at": 0.0}
             sessions[umo] = s
+        # 旧结构兼容：补齐 manual_flags
+        flags = s.get("manual_flags")
+        if not isinstance(flags, list) or len(flags) != len(s.get("rules", [])):
+            s["manual_flags"] = [False] * len(s.get("rules", []))
         return s
 
     def get(self, umo: str) -> list[str]:
@@ -118,21 +122,102 @@ class RulesStore:
             return [str(r) for r in s.get("rules", [])]
 
     def is_stale(self, umo: str, persona: str) -> bool:
-        """规则库不存在或 persona 已变化时返回 True（需要重新提取）。"""
+        """规则库不存在或 persona 已变化时返回 True（需要重新提取）。
+
+        v1.3.0：手动规则不计入"非空"判断——只有存在自动提取规则且 persona
+        未变时才认为新鲜；若只有手动规则，仍会触发一次自动提取（二者共存）。
+        """
         with self._lock:
             s = self._data.get("sessions", {}).get(umo)
-        if not s or not s.get("rules"):
+        if not s:
+            return True
+        rules = s.get("rules", [])
+        flags = s.get("manual_flags", [])
+        has_auto = any(
+            not (i < len(flags) and flags[i]) for i in range(len(rules))
+        )
+        if not has_auto:
             return True
         return str(s.get("persona_hash", "")) != persona_hash(persona)
 
     def set_rules(self, umo: str, persona: str, rules: list[str]) -> list[str]:
+        """写入自动提取的规则；保留手动规则（置于最前，去重）。"""
         with self._lock:
             s = self._session(umo)
-            s["rules"] = [str(r)[:MAX_RULE_CHARS] for r in rules[:MAX_RULES]]
+            manual = [
+                str(r)
+                for r, f in zip(s.get("rules", []), s.get("manual_flags", []))
+                if f
+            ]
+            auto: list[str] = []
+            for r in rules[:MAX_RULES]:
+                t = str(r)[:MAX_RULE_CHARS]
+                if t and t not in manual and t not in auto:
+                    auto.append(t)
+            s["rules"] = manual[:MAX_RULES] + auto
+            s["manual_flags"] = [True] * len(manual[:MAX_RULES]) + [False] * len(auto)
             s["persona_hash"] = persona_hash(persona)
             s["updated_at"] = time.time()
             self.save()
         return s["rules"]
+
+    # ---------------------------------------------------- 手动管理（v1.3.0）
+    def add_manual(self, umo: str, rule_text: str) -> tuple[bool, str]:
+        """手动添加一条规则。返回 (是否成功, 提示信息)。"""
+        t = str(rule_text or "").strip()[:MAX_RULE_CHARS]
+        if not t:
+            return False, "规则文本为空。"
+        with self._lock:
+            s = self._session(umo)
+            rules = s.get("rules", [])
+            if t in rules:
+                return False, "该规则已存在。"
+            if len(rules) >= MAX_RULES:
+                return False, f"规则数已达上限（{MAX_RULES} 条），请先删除部分规则。"
+            s["rules"].append(t)
+            s["manual_flags"].append(True)
+            s["updated_at"] = time.time()
+            self.save()
+        return True, t
+
+    def remove(self, umo: str, index: int) -> tuple[bool, str]:
+        """按 1-based 序号删除一条规则（手动/自动均可删）。返回 (成功, 被删文本)。"""
+        with self._lock:
+            s = self._data.get("sessions", {}).get(umo)
+            if not s:
+                return False, ""
+            rules = s.get("rules", [])
+            flags = s.get("manual_flags", [])
+            if index < 1 or index > len(rules):
+                return False, ""
+            removed = str(rules.pop(index - 1))
+            if index - 1 < len(flags):
+                flags.pop(index - 1)
+            s["updated_at"] = time.time()
+            self.save()
+            return True, removed
+
+    def refresh(self, umo: str) -> None:
+        """强制重提取：清空自动规则与 persona 哈希（保留手动规则）。"""
+        with self._lock:
+            s = self._session(umo)
+            manual = [
+                str(r)
+                for r, f in zip(s.get("rules", []), s.get("manual_flags", []))
+                if f
+            ]
+            s["rules"] = manual
+            s["manual_flags"] = [True] * len(manual)
+            s["persona_hash"] = ""
+            s["updated_at"] = time.time()
+            self.save()
+
+    def manual_count(self, umo: str) -> int:
+        with self._lock:
+            s = self._data.get("sessions", {}).get(umo)
+            if not s:
+                return 0
+            return sum(1 for f in s.get("manual_flags", []) if f)
 
     def clear(self, umo: str) -> None:
         with self._lock:
