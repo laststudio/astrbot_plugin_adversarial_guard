@@ -18,8 +18,10 @@ import re
 import time
 
 from astrbot.api import AstrBotConfig, logger
+from astrbot.api.all import MessageChain
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.event.filter import EventMessageType
+from astrbot.api.message_components import Plain
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star
 
@@ -29,6 +31,7 @@ try:
 except Exception:  # pragma: no cover - 兼容旧版本
     TextPart = None
 
+from .core.audit import AuditLog
 from .core.judge import (
     JUDGE_SYSTEM_PROMPT,
     Verdict,
@@ -74,9 +77,15 @@ HELP_TEXT = (
     "/guard on|off - 本会话开关审查\n"
     "/guard stats - 查看奖惩统计与近 7 天趋势\n"
     "/guard rules - 查看本会话规则库（判官逐条对照）\n"
+    "/guard rules add <规则> - 手动添加规则（管理员）\n"
+    "/guard rules del <序号> - 删除指定规则（管理员）\n"
+    "/guard rules refresh - 强制重新提取规则（管理员）\n"
     "/guard patch - 根据高频违规生成人格补丁建议（管理员）\n"
-    "/guard memory - 查看本会话长期记忆（C总结+A复审的教训）\n"
-    "/guard forget <序号|all> - 删除长期记忆（管理员）\n"
+    "/guard memory - 查看长期记忆（🌐为全局共享教训）\n"
+    "/guard log [条数] - 查看违规审计日志\n"
+    "/guard report on|off - 注册/取消定时报告推送（管理员）\n"
+    "/guard forget <序号|all> - 删除本会话长期记忆（管理员）\n"
+    "/guard forget global <序号|all> - 删除全局教训（管理员）\n"
     "/guard test <文本> - 让判官A审查指定文本\n"
     "/guard reset - 清空本会话账本（管理员）"
 )
@@ -119,7 +128,19 @@ class AdversarialGuard(Star):
         self.memory = MemoryStore(
             path=os.path.join(data_dir, "memory.json"),
             max_entries=self._iget("memory_max_entries", 20, 1, 100),
+            promote_threshold=self._iget("global_memory_promote", 3, 0, 100),
         )
+        # v1.3.0：违规审计日志（JSONL）+ 审查并发限流 + 定时报告任务
+        self.audit = AuditLog(
+            path=os.path.join(data_dir, "violations.jsonl"),
+            max_bytes=self._iget("audit_max_mb", 1, 1, 100) * 1024 * 1024,
+            enabled=bool(self.config.get("audit_log_enabled", True)),
+        )
+        self._judge_sem = asyncio.Semaphore(
+            max(1, self._iget("judge_max_concurrency", 2, 1, 16))
+        )
+        self._report_task: asyncio.Task | None = None
+        self._report_sent_date: str = ""  # 当天已推送日期（防重复）
         # 后台总结任务集合（插件卸载时等待收尾）
         self._summary_tasks: set = set()
         # v1.2.0：规则库 + 审查缓存 + 人工反馈冷却
@@ -265,8 +286,13 @@ class AdversarialGuard(Star):
                     self._schedule_rules_extract(event, persona)
 
             # v1.1.0：长期记忆注入（C 总结、A 复审过的教训条目），先于窗口反馈
+            # v1.3.0：使用 全局层+会话层 合并视图，并受注入预算约束
+            memory_text = ""
             if bool(self.config.get("memory_injection", True)):
-                memory_text = MemoryStore.render_entries(self.memory.entries(umo))
+                memory_text = MemoryStore.render_entries(
+                    self.memory.entries_merged(umo),
+                    max_lines=self._iget("memory_inject_lines", 8, 1, 20),
+                )
                 if memory_text:
                     self._inject_text(req, persona, memory_text)
 
@@ -275,6 +301,28 @@ class AdversarialGuard(Star):
             feedback = self.ledger.injection_text(umo, self._threshold())
             if not feedback:
                 return
+            # v1.3.0：注入预算控制——记忆块优先，窗口反馈超预算时裁剪行数
+            budget = self._iget("inject_budget_chars", 0, 0, 100000)
+            if budget > 0:
+                used = len(memory_text)
+                remain = budget - used
+                if remain < 100:
+                    logger.debug(
+                        f"[{PLUGIN_NAME}] 注入预算不足（已用 {used}/{budget}），本轮跳过窗口反馈"
+                    )
+                    return
+                if len(feedback) > remain:
+                    # 按行裁剪到预算内，保留标签头尾
+                    lines = feedback.split("\n")
+                    kept = [lines[0]]
+                    size = len(lines[0])
+                    for ln in lines[1:-1]:
+                        if size + len(ln) + 1 > remain - 30:
+                            break
+                        kept.append(ln)
+                        size += len(ln) + 1
+                    kept.append(lines[-1])
+                    feedback = "\n".join(kept)
             self._inject_text(req, persona, feedback)
         except Exception as e:
             logger.error(f"[{PLUGIN_NAME}] on_llm_request 异常(已忽略): {e}")
@@ -495,10 +543,53 @@ class AdversarialGuard(Star):
                 max_regen_rounds=max(0, self._iget("max_regen_rounds", 2, 0)),
             )
 
+            # v1.3.0：保守兜底——修复后仍未过审时可配置为不发送瑕疵回复
+            if (
+                not result.ok
+                and bool(self.config.get("conservative_fallback", False))
+                and result.method != "original"  # 修复尝试过但未过审
+            ):
+                fallback_msg = str(
+                    self.config.get(
+                        "fallback_message",
+                        "抱歉，我这轮的回复没能通过审核，换个说法问问我吧~",
+                    )
+                ).strip() or "抱歉，我这轮的回复没能通过审核。"
+                resp.completion_text = fallback_msg
+                logger.info(f"[{PLUGIN_NAME}] 保守兜底生效：瑕疵回复未发送，替换为提示语")
+                self.audit.record(
+                    umo,
+                    score=verdict.score,
+                    ok=False,
+                    violations=verdict.violations,
+                    repair={
+                        "method": result.method,
+                        "ok": result.ok,
+                        "attempts": len(result.attempts),
+                    },
+                    reply=reply,
+                    user_msg=user_msg,
+                )
+                return
+
             final = (result.final_text or "").strip()
             if final and final != reply:
                 resp.completion_text = final
             self.ledger.record_repair(umo, result.ok, result.method)
+            # v1.3.0：违规审计日志（JSONL，供事后追溯误判）
+            self.audit.record(
+                umo,
+                score=verdict.score,
+                ok=result.ok,
+                violations=verdict.violations,
+                repair={
+                    "method": result.method,
+                    "ok": result.ok,
+                    "attempts": len(result.attempts),
+                },
+                reply=final or reply,
+                user_msg=user_msg,
+            )
             logger.info(f"[{PLUGIN_NAME}] 修复完成 method={result.method} ok={result.ok}")
             if bool(self.config.get("notify_on_fix", False)) and final != reply:
                 # 区分"已通过复检的修正"与"仅替换为更优版本但仍未过审"，避免误导用户
@@ -685,10 +776,12 @@ class AdversarialGuard(Star):
             else:
                 user_prompt = user_prompt + "\n\n" + rules_block
         try:
-            raw = await asyncio.wait_for(
-                self._chat_text(provider, JUDGE_SYSTEM_PROMPT, user_prompt, use_judge_model=True),
-                timeout=self._timeout(),
-            )
+            # v1.3.0：并发限流——多消息并发触发时保护 provider 不被限流
+            async with self._judge_sem:
+                raw = await asyncio.wait_for(
+                    self._chat_text(provider, JUDGE_SYSTEM_PROMPT, user_prompt, use_judge_model=True),
+                    timeout=self._timeout(),
+                )
         except Exception as e:
             logger.warning(f"[{PLUGIN_NAME}] 判官调用失败: {e}")
             return None
@@ -828,6 +921,48 @@ class AdversarialGuard(Star):
             yield event.plain_result(text)
             return
         if sub == "rules":
+            arg = parts[2].lower() if len(parts) > 2 else ""
+            # v1.3.0：手动管理（add/del/refresh）
+            if arg == "add":
+                if not _is_admin(event):
+                    yield event.plain_result("该操作需要管理员权限。")
+                    return
+                rule_text = (event.message_str or "").split(maxsplit=3)
+                text = rule_text[3].strip() if len(rule_text) > 3 else ""
+                if not text:
+                    yield event.plain_result("用法：/guard rules add <规则描述>")
+                    return
+                ok, msg = self.rules_store.add_manual(umo, text)
+                yield event.plain_result(
+                    f"已手动添加规则 R{len(self.rules_store.get(umo))}：{msg}" if ok
+                    else f"添加失败：{msg}"
+                )
+                return
+            if arg == "del":
+                if not _is_admin(event):
+                    yield event.plain_result("该操作需要管理员权限。")
+                    return
+                idx_raw = parts[3] if len(parts) > 3 else ""
+                if not idx_raw.isdigit():
+                    yield event.plain_result("用法：/guard rules del <序号>（序号见 /guard rules）")
+                    return
+                ok, removed = self.rules_store.remove(umo, int(idx_raw))
+                yield event.plain_result(
+                    f"已删除规则：{removed}" if ok else "序号超出范围。"
+                )
+                return
+            if arg == "refresh":
+                if not _is_admin(event):
+                    yield event.plain_result("该操作需要管理员权限。")
+                    return
+                self.rules_store.refresh(umo)
+                persona = self._last_persona.get(umo, "")
+                if persona:
+                    self._schedule_rules_extract(event, persona)
+                    yield event.plain_result("已清空自动规则（手动规则保留），下次对话将重新提取。")
+                else:
+                    yield event.plain_result("已清空自动规则（手动规则保留）。与 bot 对话一次后重新提取。")
+                return
             rules = self.rules_store.get(umo)
             if not rules:
                 yield event.plain_result(
@@ -835,8 +970,20 @@ class AdversarialGuard(Star):
                     "无明文规则的人格可能提取为空，此时判官使用模糊对照。"
                 )
                 return
-            lines = [f"本会话规则库（共 {len(rules)} 条，判官逐条对照）："]
-            lines.extend(f"R{i}. {r}" for i, r in enumerate(rules, 1))
+            manual_n = self.rules_store.manual_count(umo)
+            lines = [
+                f"本会话规则库（共 {len(rules)} 条，手动 {manual_n} 条，判官逐条对照）："
+            ]
+            flags = []
+            try:
+                s = self.rules_store._data.get("sessions", {}).get(umo) or {}
+                flags = s.get("manual_flags", [])
+            except Exception:
+                pass
+            for i, r in enumerate(rules, 1):
+                tag = "✋" if (i - 1 < len(flags) and flags[i - 1]) else ""
+                lines.append(f"R{i}{tag} {r}")
+            lines.append("✋=手动规则（refresh 时保留）｜/guard rules add|del|refresh 可管理")
             yield event.plain_result("\n".join(lines))
             return
         if sub == "patch":
@@ -848,7 +995,8 @@ class AdversarialGuard(Star):
             return
         if sub == "memory":
             self._refresh_memory_params()
-            entries = self.memory.entries(umo)
+            entries = self.memory.entries_merged(umo)
+            gcount = len(self.memory.global_entries())
             if not entries:
                 yield event.plain_result("本会话暂无长期记忆条目。违规经总结与复审后会自动积累。")
                 return
@@ -856,20 +1004,77 @@ class AdversarialGuard(Star):
                 entries,
                 key=lambda e: (-int(e.get("count", 1)), -float(e.get("ts", 0))),
             )
-            lines = [f"本会话长期记忆（共 {len(ranked)} 条，注入时按次数取前 8 条）："]
+            lines = [
+                f"长期记忆（共 {len(ranked)} 条，全局 {gcount} 条，注入时按次数取前 8 条）："
+            ]
             for i, e in enumerate(ranked, 1):
                 corrected = "（复审修正版）" if (e.get("meta") or {}).get("corrected") else ""
+                scope = "🌐全局" if e.get("global") else "🔒会话"
                 lines.append(
-                    f"{i}. {e.get('rule', '')} ×{e.get('count', 1)}{corrected}\n"
+                    f"{i}. [{scope}] {e.get('rule', '')} ×{e.get('count', 1)}{corrected}\n"
                     f"   └ {e.get('lesson', '')}"
                 )
             yield event.plain_result("\n".join(lines))
+            return
+        if sub == "log":
+            n = 10
+            arg = parts[2] if len(parts) > 2 else ""
+            if arg.isdigit():
+                n = max(1, min(50, int(arg)))
+            entries = self.audit.tail(n, umo=umo)
+            yield event.plain_result(self.audit.render(entries))
+            return
+        if sub == "report":
+            if not _is_admin(event):
+                yield event.plain_result("该操作需要管理员权限。")
+                return
+            arg = parts[2].lower() if len(parts) > 2 else ""
+            if arg == "on":
+                added = self.ledger.add_report_target(umo)
+                yield event.plain_result(
+                    "已注册本会话为定时报告目标。" if added else "本会话已是报告目标。"
+                )
+                return
+            if arg == "off":
+                removed = self.ledger.remove_report_target(umo)
+                yield event.plain_result(
+                    "已取消本会话的定时报告。" if removed else "本会话不是报告目标。"
+                )
+                return
+            targets = self.ledger.report_targets()
+            time_str = str(self.config.get("daily_report_time", "21:00") or "21:00")
+            yield event.plain_result(
+                f"定时报告：{'启用' if targets else '未启用'}｜"
+                f"推送时间：每日 {time_str}｜目标数：{len(targets)}\n"
+                "用法：/guard report on|off（在目标会话中执行）"
+            )
             return
         if sub == "forget":
             if not _is_admin(event):
                 yield event.plain_result("该操作需要管理员权限。")
                 return
             arg = parts[2] if len(parts) > 2 else ""
+            # v1.3.0：全局层管理
+            if arg == "global":
+                garg = parts[3] if len(parts) > 3 else ""
+                if garg == "all":
+                    self.memory.clear_global()
+                    yield event.plain_result("已清空全局教训层。")
+                    return
+                if garg.isdigit():
+                    gentries = self.memory.global_entries()
+                    idx = int(garg)
+                    if idx < 1 or idx > len(gentries):
+                        yield event.plain_result(
+                            f"序号超出范围（1-{len(gentries)}），可先发送 /guard memory 查看 🌐 条目。"
+                        )
+                        return
+                    target = gentries[idx - 1]
+                    self.memory.remove_global(idx)
+                    yield event.plain_result(f"已删除全局教训：{target.get('rule', '')}")
+                    return
+                yield event.plain_result("用法：/guard forget global <序号|all>")
+                return
             if arg == "all":
                 self.memory.clear(umo)
                 yield event.plain_result("已清空本会话的全部长期记忆。")
@@ -997,8 +1202,73 @@ class AdversarialGuard(Star):
             lines.append(f"建议改写：\n{verdict.rewrite}")
         yield event.plain_result("\n".join(lines))
 
+    # ====================================================== 定时报告（v1.3.0）
+    async def initialize(self) -> None:
+        """插件加载时启动定时报告推送任务。"""
+        if self.ledger.report_targets():
+            self._start_report_loop()
+
+    def _start_report_loop(self) -> None:
+        """幂等启动报告循环。"""
+        if self._report_task and not self._report_task.done():
+            return
+        self._report_task = asyncio.create_task(self._report_loop())
+        logger.info(f"[{PLUGIN_NAME}] 定时报告任务已启动")
+
+    async def _report_loop(self):
+        """每 60 秒检查一次，到达 daily_report_time 时向注册目标推送汇总。"""
+        while True:
+            try:
+                await asyncio.sleep(60)
+                if not self.ledger.report_targets():
+                    continue  # 无目标时不退出循环（随时可 /guard report on 激活）
+                now_str = time.strftime("%H:%M")
+                target = str(self.config.get("daily_report_time", "21:00") or "21:00")
+                today = time.strftime("%Y-%m-%d")
+                if now_str < target or self._report_sent_date == today:
+                    continue
+                self._report_sent_date = today
+                text = self._build_report_text()
+                for umo in self.ledger.report_targets():
+                    try:
+                        await self.context.send_message(umo, MessageChain([Plain(text)]))
+                    except Exception as e:
+                        logger.warning(f"[{PLUGIN_NAME}] 定时报告推送到 {umo} 失败: {e}")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"[{PLUGIN_NAME}] 定时报告循环异常（继续运行）: {e}")
+
+    def _build_report_text(self) -> str:
+        """汇总跨会话统计为日报文本。"""
+        s = self.ledger.global_summary()
+        rate = f"{s['violated'] / s['checked'] * 100:.1f}%" if s["checked"] else "N/A"
+        lines = [
+            f"🛡️ 对抗人格守护日报（{time.strftime('%Y-%m-%d')}）",
+            (
+                f"活跃会话：{s['sessions']}｜累计审查：{s['checked']}｜"
+                f"违规：{s['violated']}（{rate}）｜修复成功：{s['fixed']}"
+            ),
+        ]
+        if s["rule_counts"]:
+            ranked = sorted(s["rule_counts"].items(), key=lambda kv: -kv[1])[:5]
+            lines.append("高频违规 Top5：")
+            lines.extend(f"- {r} ×{c}" for r, c in ranked)
+        gcount = len(self.memory.global_entries())
+        if gcount:
+            lines.append(f"全局共享教训：{gcount} 条")
+        if s["worst"]:
+            lines.append("违规最多会话：")
+            lines.extend(f"- {umo} ×{v}" for umo, v in s["worst"][:3])
+        return "\n".join(lines)
+
     async def terminate(self):
         """插件卸载/停用时等待后台总结任务收尾并持久化账本与长期记忆。"""
+        try:
+            if self._report_task and not self._report_task.done():
+                self._report_task.cancel()
+        except Exception:
+            pass
         try:
             tasks = [t for t in self._summary_tasks if not t.done()]
             if tasks:

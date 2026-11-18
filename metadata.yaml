@@ -1,6 +1,6 @@
 name: astrbot_plugin_adversarial_guard
 display_name: 对抗人格守护
-desc: "GAN 式双 AI 对抗架构：判官 AI(A) 实时审查主 AI(B) 的输出是否遵守人格提示词，违规时自动快改/带反馈重生成，并以奖惩记账 + 上下文反馈注入模拟强化学习；v1.2.0 新增规则库逐条对照、审查抽样与缓存、豁免名单、人格补丁建议、人工反馈奖惩、修复熔断与趋势统计。"
-version: 1.2.0
+desc: "GAN 式双 AI 对抗架构：判官 AI(A) 实时审查主 AI(B) 的输出是否遵守人格提示词，违规时自动快改/带反馈重生成，并以奖惩记账 + 上下文反馈注入模拟强化学习；v1.3.0 新增跨会话全局记忆、判官防注入加固、规则库手动管理、违规审计日志、保守兜底、注入预算控制、审查并发限流与定时报告推送。"
+version: 1.3.0
 author: leitianshuo1337
 repo: https://github.com/laststudio/astrbot_plugin_adversarial_guard

@@ -155,5 +155,50 @@
     "description": "正反馈关键词（英文逗号分隔），命中计入 +1 分。",
     "type": "string",
     "default": "说得好,答对了,对了,不错,很棒"
+  },
+  "global_memory_promote": {
+    "description": "全局记忆晋升阈值：某教训在单会话内出现达到该次数后自动晋升为全局教训（所有会话共享注入）。0=关闭晋升。",
+    "type": "int",
+    "default": 3
+  },
+  "memory_inject_lines": {
+    "description": "长期记忆注入行数上限（1-20，含全局+会话合并视图，按次数取前 N 条）。",
+    "type": "int",
+    "default": 8
+  },
+  "inject_budget_chars": {
+    "description": "注入总预算（字符数）：记忆块+窗口反馈合计超预算时优先裁剪窗口反馈。0=不限制。",
+    "type": "int",
+    "default": 0
+  },
+  "audit_log_enabled": {
+    "description": "违规审计日志：每次违规的裁决与修复过程写入 violations.jsonl，/guard log 查看。",
+    "type": "bool",
+    "default": true
+  },
+  "audit_max_mb": {
+    "description": "审计日志滚动大小（MB，超过后滚动为 .1 备份）。",
+    "type": "int",
+    "default": 1
+  },
+  "conservative_fallback": {
+    "description": "保守兜底：修复尝试后仍未过审时，不发送瑕疵回复，替换为 fallback_message。默认关闭（放行最优候选）。",
+    "type": "bool",
+    "default": false
+  },
+  "fallback_message": {
+    "description": "保守兜底时发送给用户的提示语。",
+    "type": "string",
+    "default": "抱歉，我这轮的回复没能通过审核，换个说法问问我吧~"
+  },
+  "judge_max_concurrency": {
+    "description": "判官并发上限（1-16）：多消息并发触发时同时审查的最大数量，防止 provider 限流。",
+    "type": "int",
+    "default": 2
+  },
+  "daily_report_time": {
+    "description": "定时报告推送时间（HH:MM，24小时制）。需先在目标会话执行 /guard report on 注册。",
+    "type": "string",
+    "default": "21:00"
   }
 }
